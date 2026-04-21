@@ -1,0 +1,70 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-brand-primary: var(--brand-primary);
+  --color-brand-secondary: var(--brand-secondary);
+  --color-brand-bg: var(--brand-bg);
+  --color-brand-surface: var(--brand-surface);
+  --color-brand-border: var(--brand-border);
+  --color-text-main: var(--text-main);
+  --color-text-muted: var(--text-muted);
+
+  /* Map standard utility colors to theme variables for global skinning */
+  --color-white: var(--brand-surface);
+  --color-slate-50: var(--brand-bg);
+  --color-slate-100: var(--brand-border);
+  --color-slate-200: var(--brand-border);
+  --color-slate-300: var(--text-muted);
+  --color-slate-400: var(--text-muted);
+  --color-slate-500: var(--text-muted);
+  --color-slate-600: var(--text-main);
+  --color-slate-700: var(--text-main);
+  --color-slate-800: var(--text-main);
+  --color-slate-900: var(--text-main);
+}
+
+:root {
+  --brand-primary: #3b82f6; /* Medical Blue */
+  --brand-secondary: #60a5fa;
+  --brand-bg: #fdfaff;
+  --brand-surface: #ffffff;
+  --brand-border: #f3e8ff;
+  --text-main: #1e293b;
+  --text-muted: #64748b;
+  --grid-color: #f5f3ff;
+}
+
+.dark {
+  --brand-bg: #030712;
+  --brand-surface: #111827;
+  --brand-border: #1f2937;
+  --text-main: #f9fafb;
+  --text-muted: #9ca3af;
+  --grid-color: #111827;
+  --brand-primary: #3b82f6; /* Medical Blue */
+  --brand-secondary: #60a5fa;
+}
+
+@layer base {
+  body {
+    background-color: var(--brand-bg);
+    color: var(--text-main);
+    @apply font-sans antialiased transition-colors duration-300;
+  }
+}
+
+.sleek-gradient-text {
+  @apply text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-cyan-500;
+}
+
+.technical-grid {
+  background-image: radial-gradient(circle at 1px 1px, var(--grid-color) 1px, transparent 0);
+  background-size: 32px 32px;
+}
+
+

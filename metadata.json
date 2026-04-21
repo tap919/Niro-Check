@@ -1,0 +1,6 @@
+{
+  "name": "Niro Check",
+  "description": "A comprehensive, offline-secure diabetes monitoring tool with deterministic pattern analytics for tracking glucose, meals, and meds.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
