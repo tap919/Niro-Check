@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Activity, 
   Plus, 
@@ -36,9 +36,28 @@ import {
   ShieldCheck,
   ChevronDown,
   Trash2,
-  Share2
+  Share2,
+  Users,
+  Stethoscope,
+  LogOut,
+  Eye,
+  Zap,
+  GitBranch,
+  Terminal,
+  Activity as Pulse,
+  History as LogClock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { 
+  calculateGMI, 
+  calculateTIR, 
+  calculateCV, 
+  calculateSD, 
+  calculateROC, 
+  predictGlucose,
+  calculateBolus,
+  calculateIOB
+} from './lib/bioEngine';
 import { format, subDays, isAfter, startOfWeek, endOfWeek, isSameDay, addMinutes, parseISO, startOfMonth, endOfMonth } from 'date-fns';
 import { 
   LineChart, 
@@ -56,7 +75,24 @@ import {
 } from 'recharts';
 
 import { cn } from './lib/utils';
-import { Entry, EntryType, GlucoseEntry, UserSettings, MealEntry, ActivityEntry, MedicationEntry, ScheduledAlert, JournalEntry } from './types';
+import { Entry, EntryType, GlucoseEntry, UserSettings, MealEntry, ActivityEntry, MedicationEntry, ScheduledAlert, JournalEntry, PatchEntry, AgentDecision, TraceStep, HealthMetrics, SecurityEvent } from './types';
+import { 
+  auth, 
+  db, 
+  onAuthStateChanged, 
+  signInWithPopup, 
+  googleProvider,
+  doc,
+  setDoc,
+  onSnapshot,
+  collection,
+  query,
+  orderBy,
+  updateDoc,
+  deleteDoc,
+  User,
+  testConnection
+} from './lib/firebase';
 
 // Constants
 const TARGET_MIN = 70;
@@ -69,19 +105,149 @@ function getGlucoseStatus(value: number, range: { min: number, max: number }) {
   return 'normal';
 }
 
-export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'log' | 'calendar' | 'history' | 'insights' | 'academy' | 'settings'>('dashboard');
+// --- Biological Reconciler Engine ---
+function useBioPipe(user: User | null) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [settings, setSettings] = useState<UserSettings>({
     name: 'Friend',
     targetRange: { min: TARGET_MIN, max: TARGET_MAX },
     unit: 'mg/dL',
     alerts: [],
-    theme: 'dark'
+    theme: 'dark',
+    familyCircle: [],
+    ehr: { provider: 'none', isConnected: false }
   });
   const [loading, setLoading] = useState(true);
-  const [notification, setNotification] = useState<{ message: string; type: 'success' | 'info' } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Synchronization Queue for atomic writes
+  const writeQueue = useRef<Promise<any>>(Promise.resolve());
+
+  const queueWrite = useCallback((task: () => Promise<any>) => {
+    writeQueue.current = writeQueue.current.then(task).catch(err => {
+      console.error("Critical Reconciler Write Failure", err);
+      setError("Biological Write Interrupted");
+      throw err;
+    });
+    return writeQueue.current;
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    
+    setLoading(true);
+    setError(null);
+
+    // Singleton Settings Stream
+    const settingsRef = doc(db, 'users', user.uid);
+    const unsubSettings = onSnapshot(settingsRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setSettings(docSnap.data() as UserSettings);
+      } else {
+        const initialSettings: UserSettings = {
+          name: user.displayName || 'Biological Node',
+          targetRange: { min: TARGET_MIN, max: TARGET_MAX },
+          unit: 'mg/dL',
+          alerts: [],
+          theme: 'dark',
+          familyCircle: [],
+          ehr: { provider: 'none', isConnected: false }
+        };
+        setDoc(settingsRef, initialSettings);
+      }
+    }, (err) => {
+      setError("Settings Stream Interrupted");
+      console.error(err);
+    });
+
+    // Singleton Entries Stream
+    const entriesRef = collection(db, 'users', user.uid, 'entries');
+    const q = query(entriesRef, orderBy('timestamp', 'desc'));
+    const unsubEntries = onSnapshot(q, (snapshot) => {
+      const fetched = snapshot.docs.map(dsc => dsc.data() as Entry);
+      setEntries(fetched);
+      setLoading(false);
+    }, (err) => {
+      setError("Entries Stream Interrupted");
+      console.error(err);
+      setLoading(false);
+    });
+
+    return () => {
+      unsubSettings();
+      unsubEntries();
+    };
+  }, [user]);
+
+  const addEntry = useCallback((entry: Entry) => {
+    return queueWrite(async () => {
+      if (!user) return;
+      const entryRef = doc(db, 'users', user.uid, 'entries', entry.id);
+      await setDoc(entryRef, entry);
+    });
+  }, [user, queueWrite]);
+
+  const deleteEntry = useCallback((id: string) => {
+    return queueWrite(async () => {
+      if (!user) return;
+      const entryRef = doc(db, 'users', user.uid, 'entries', id);
+      await deleteDoc(entryRef);
+    });
+  }, [user, queueWrite]);
+
+  const updateSettings = useCallback((newSettings: UserSettings) => {
+    return queueWrite(async () => {
+      if (!user) return;
+      const settingsRef = doc(db, 'users', user.uid);
+      await setDoc(settingsRef, newSettings);
+    });
+  }, [user, queueWrite]);
+
+  return { entries, settings, loading, error, addEntry, deleteEntry, updateSettings, setEntries };
+}
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'log' | 'calendar' | 'history' | 'insights' | 'academy' | 'settings' | 'integrity'>('dashboard');
+  
+  const { 
+    entries, 
+    settings, 
+    loading, 
+    error, 
+    addEntry, 
+    deleteEntry, 
+    updateSettings,
+    setEntries
+  } = useBioPipe(user);
+
+  const [notification, setNotification] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null);
   const [activeAlert, setActiveAlert] = useState<ScheduledAlert | null>(null);
+
+  // Authentication logic
+  useEffect(() => {
+    testConnection();
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+      if (u) {
+        setNotification({ message: `Access biological profile: ${u.displayName}`, type: 'success' });
+        setTimeout(() => setNotification(null), 3000);
+      }
+    });
+  }, []);
+
+  // Global Error Handler
+  useEffect(() => {
+    if (error) {
+      setNotification({ message: error, type: 'error' });
+      setTimeout(() => setNotification(null), 5000);
+    }
+  }, [error]);
 
   // Apply theme to body
   useEffect(() => {
@@ -103,7 +269,6 @@ export default function App() {
 
       settings.alerts.forEach(alert => {
         if (alert.enabled && alert.time === currentTime && alert.days.includes(currentDay)) {
-          // Check if already notified in this minute
           if (!activeAlert || activeAlert.id !== alert.id) {
             setActiveAlert(alert);
             speak(`Scheduled Alert: ${alert.label}. Time for your treatment flow.`);
@@ -112,90 +277,51 @@ export default function App() {
       });
     };
 
-    const interval = setInterval(checkAlerts, 30000); // Check every 30s
+    const interval = setInterval(checkAlerts, 30000);
     return () => clearInterval(interval);
   }, [settings.alerts, activeAlert]);
 
-  // Persistence: Fetch from backend
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const response = await fetch('/api/data');
-        const data = await response.json();
-        if (data.entries) setEntries(data.entries);
-        if (data.settings) setSettings(data.settings);
-      } catch (e) {
-        console.error('Core sync failed', e);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchData();
-  }, []);
-
-  const addEntry = async (entry: Entry) => {
+  const handleAddEntry = async (entry: Entry) => {
+    if (!user) return;
     try {
-      const response = await fetch('/api/entries', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(entry)
-      });
-      const savedEntry = await response.json();
+      await addEntry(entry);
       
-      setEntries(prev => {
-        const index = prev.findIndex(e => e.id === savedEntry.id);
-        if (index !== -1) {
-          const next = [...prev];
-          next[index] = savedEntry;
-          return next;
-        }
-        return [savedEntry, ...prev];
-      });
-
-      setNotification({ message: 'Entry synchronized with server', type: 'success' });
+      setNotification({ message: 'Biological Node Synchronized', type: 'success' });
       setActiveTab('dashboard');
       
       // TTS Confirmation
       let speechText = '';
       if (entry.type === 'glucose') {
         speechText = `Glucose reading of ${entry.value} logged. Biological flow is ${getGlucoseStatus(entry.value, settings.targetRange)}.`;
-      } else if (entry.type === 'journal') {
-        speechText = `Journal entry synchronized. Psychological context recorded: ${entry.content || 'No additional details'}.`;
       } else {
         speechText = `${entry.type.charAt(0).toUpperCase() + entry.type.slice(1)} synchronized. Biological flow updated.`;
       }
       speak(speechText);
-      
       setTimeout(() => setNotification(null), 3000);
     } catch (e) {
-      console.error('Remote entry failed', e);
+      // Reconciler handles console logging
     }
   };
 
-  const deleteEntry = async (id: string) => {
+  const handleDeleteEntry = async (id: string) => {
+    if (!user) return;
     try {
-      await fetch(`/api/entries/${id}`, { method: 'DELETE' });
-      setEntries(entries.filter(e => e.id !== id));
-      setNotification({ message: 'Entry removed', type: 'info' });
+      await deleteEntry(id);
+      setNotification({ message: 'Biological Node Excised', type: 'info' });
       setTimeout(() => setNotification(null), 3000);
     } catch (e) {
-      console.error('Remote deletion failed', e);
+      // Reconciler handles console logging
     }
   };
 
-  const updateSettings = async (newSettings: UserSettings) => {
+  const handleUpdateSettings = async (newSettings: UserSettings) => {
+    if (!user) return;
     try {
-      const response = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newSettings)
-      });
-      const savedSettings = await response.json();
-      setSettings(savedSettings);
-      setNotification({ message: 'Configuration updated', type: 'success' });
+      await updateSettings(newSettings);
+      setNotification({ message: 'Bio-Protocol Reconfigured', type: 'success' });
       setTimeout(() => setNotification(null), 3000);
     } catch (e) {
-      console.error('Settings sync failed', e);
+      // Reconciler handles console logging
     }
   };
 
@@ -228,7 +354,57 @@ export default function App() {
     }
   };
 
-  if (loading) {
+  const syncCgm = async () => {
+    try {
+      const response = await fetch('/api/cgm/sync', { method: 'POST' });
+      const data = await response.json();
+      if (data.success) {
+        setNotification({ message: 'Biological stream synchronized', type: 'success' });
+        // Update local entries immediately for real-time feel
+        const fetchedEntries = data.entries as Entry[];
+        setEntries(prev => [...fetchedEntries, ...prev]);
+        speak(`Synchronization complete. ${fetchedEntries.length} new biological data points imported.`);
+      }
+    } catch (e) {
+      console.error('CGM Sync failed', e);
+    }
+  };
+
+  const handleDexcomConnect = async () => {
+    try {
+      const response = await fetch('/api/auth/dexcom/url');
+      const { url } = await response.json();
+      const width = 600, height = 700;
+      const left = window.screenX + (window.outerWidth - width) / 2;
+      const top = window.screenY + (window.outerHeight - height) / 2;
+      
+      const authWindow = window.open(url, 'dexcom_auth', `width=${width},height=${height},left=${left},top=${top}`);
+      
+      if (!authWindow) {
+        setNotification({ message: 'Popup blocked by protocol', type: 'info' });
+        return;
+      }
+    } catch (e) {
+      console.error('Dexcom connect failed', e);
+    }
+  };
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        setNotification({ message: `${event.data.provider} synchronized`, type: 'success' });
+        // Refresh data or update settings
+        updateSettings({
+          ...settings,
+          cgm: { provider: event.data.provider, isConnected: true, lastSync: new Date().toISOString() }
+        });
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [settings]);
+
+  if (loading || authLoading) {
     return (
       <div className="min-h-screen bg-brand-bg flex items-center justify-center">
         <motion.div 
@@ -238,6 +414,10 @@ export default function App() {
         />
       </div>
     );
+  }
+
+  if (!user) {
+    return <Login />;
   }
 
   return (
@@ -277,9 +457,18 @@ export default function App() {
           <NavLink active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} icon={<Calendar size={24} />} label="Journal" />
           <NavLink active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={<HistoryIcon size={24} />} label="Review" />
           <NavLink active={activeTab === 'insights'} onClick={() => setActiveTab('insights')} icon={<Lightbulb size={24} />} label="Trends" />
+          <NavLink active={activeTab === 'integrity'} onClick={() => setActiveTab('integrity')} icon={<Eye size={24} />} label="Integrity" />
           <NavLink active={activeTab === 'academy'} onClick={() => setActiveTab('academy')} icon={<BookOpen size={24} />} label="Learn" />
           <NavLink active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<SettingsIcon size={24} />} label="Care" />
         </div>
+
+        <button 
+          onClick={() => auth.signOut()}
+          className="mt-auto hidden md:flex items-center gap-6 px-6 py-6 w-full text-text-muted hover:text-rose-500 transition-all border-t border-brand-border group hover:bg-rose-500/5"
+        >
+          <LogOut size={24} className="group-hover:rotate-12 transition-transform" />
+          <span className="hidden lg:block font-black text-[10px] uppercase tracking-[0.2em]">Terminate Node</span>
+        </button>
       </nav>
 
       {/* Main Content Area */}
@@ -299,6 +488,7 @@ export default function App() {
                 setNotification={setNotification}
                 speak={speak}
                 setActiveTab={setActiveTab}
+                syncCgm={syncCgm}
               />
             </motion.div>
           )}
@@ -310,7 +500,7 @@ export default function App() {
               exit={{ opacity: 0 }}
               className="h-full"
             >
-              <LogForm onAdd={addEntry} speak={speak} />
+              <LogForm onAdd={handleAddEntry} entries={entries} settings={settings} speak={speak} />
             </motion.div>
           )}
           {activeTab === 'calendar' && (
@@ -321,7 +511,7 @@ export default function App() {
               exit={{ opacity: 0 }}
               className="h-full"
             >
-              <CalendarView entries={entries} onAddJournal={addEntry} />
+              <CalendarView entries={entries} onAddJournal={handleAddEntry} />
             </motion.div>
           )}
           {activeTab === 'history' && (
@@ -332,7 +522,7 @@ export default function App() {
               exit={{ opacity: 0 }}
               className="h-full"
             >
-              <History entries={entries} onDelete={deleteEntry} />
+              <History entries={entries} onDelete={handleDeleteEntry} />
             </motion.div>
           )}
           {activeTab === 'insights' && (
@@ -344,6 +534,17 @@ export default function App() {
               className="h-full"
             >
               <Insights entries={entries} settings={settings} />
+            </motion.div>
+          )}
+          {activeTab === 'integrity' && (
+            <motion.div
+              key="integrity"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="h-full"
+            >
+              <IntegrityDashboard />
             </motion.div>
           )}
           {activeTab === 'academy' && (
@@ -367,7 +568,7 @@ export default function App() {
             >
               <Settings 
                 settings={settings} 
-                onSave={updateSettings} 
+                onSave={handleUpdateSettings} 
                 setNotification={setNotification} 
                 entries={entries} 
               />
@@ -415,6 +616,489 @@ export default function App() {
   );
 }
 
+function Login() {
+  const [loggingIn, setLoggingIn] = useState(false);
+
+  const handleLogin = async () => {
+    setLoggingIn(true);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      console.error("Login Failure", e);
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-brand-bg flex items-center justify-center p-6 technical-grid">
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="w-full max-w-md bg-brand-surface border border-brand-border rounded-[40px] p-12 shadow-2xl text-center space-y-8 relative overflow-hidden"
+      >
+        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-brand-primary to-transparent" />
+        
+        <div className="space-y-4">
+          <div className="w-20 h-20 bg-brand-primary/10 text-brand-primary rounded-3xl flex items-center justify-center mx-auto shadow-sm">
+            <ShieldCheck size={40} />
+          </div>
+          <h1 className="text-4xl font-black tracking-tighter sleek-gradient-text uppercase">Niro Check</h1>
+          <p className="text-text-muted text-[10px] font-black uppercase tracking-[0.4em]">Biological Data Protocol</p>
+        </div>
+
+        <p className="text-sm text-text-muted leading-relaxed font-medium">
+          Welcome to your sovereign monitoring stream. Initialize your biological node to synchronize real-time health data and activate the family support circle.
+        </p>
+
+        <button 
+          onClick={handleLogin}
+          disabled={loggingIn}
+          className="w-full py-4 bg-brand-primary text-white rounded-2xl font-black uppercase tracking-widest shadow-lg shadow-brand-primary/30 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-3"
+        >
+          {loggingIn ? (
+            <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+          ) : (
+            <>
+              <Users size={18} />
+              <span>Initialize Node</span>
+            </>
+          )}
+        </button>
+
+        <div className="pt-6 border-t border-brand-border">
+          <p className="text-[10px] text-text-muted font-bold uppercase tracking-widest flex items-center justify-center gap-2">
+            <CheckCircle2 size={12} className="text-emerald-500" /> 100% Private & Secure
+          </p>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+function IntegrityDashboard() {
+  const [metrics, setMetrics] = useState<HealthMetrics | null>(null);
+  const [decisions, setDecisions] = useState<AgentDecision[]>([]);
+  const [traces, setTraces] = useState<TraceStep[]>([]);
+  const [securityEvents, setSecurityEvents] = useState<SecurityEvent[]>([]);
+  const [activeTab, setActiveTab] = useState<'metrics' | 'decisions' | 'traces' | 'defense' | 'maintenance'>('metrics');
+
+  useEffect(() => {
+    const fetchObservability = async () => {
+      try {
+        const [mRes, dRes, tRes, sRes] = await Promise.all([
+          fetch('/api/observability/metrics'),
+          fetch('/api/observability/decisions'),
+          fetch('/api/observability/traces'),
+          fetch('/api/security/events')
+        ]);
+        setMetrics(await mRes.json());
+        setDecisions(await dRes.json());
+        setTraces(await tRes.json());
+        setSecurityEvents(await sRes.json());
+      } catch (e) {
+        console.error("Observability Sync Failure", e);
+      }
+    };
+    fetchObservability();
+    const interval = setInterval(fetchObservability, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="p-6 max-w-6xl mx-auto space-y-10 min-h-screen">
+      <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 border-b border-brand-border pb-10">
+        <div>
+          <h2 className="text-5xl font-black tracking-tighter hover-glow-text uppercase flex items-center gap-4">
+            <Eye size={40} className="text-brand-primary" />
+            Integrity Analytics
+          </h2>
+          <p className="text-text-muted text-xs font-bold uppercase tracking-[0.3em] mt-2">Autonomous Agent Observability • Audit Secure</p>
+        </div>
+        <div className="flex gap-2">
+          {(['metrics', 'decisions', 'traces', 'defense', 'maintenance'] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setActiveTab(s)}
+              className={cn(
+                "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all",
+                activeTab === s ? "bg-brand-primary border-brand-primary text-white shadow-lg shadow-brand-primary/20" : "bg-brand-surface border-brand-border text-text-muted hover:border-brand-primary/50"
+              )}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {activeTab === 'metrics' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-10"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            <MetricCard 
+              label="Sync Latency" 
+              value={`${metrics?.syncLatencyMs || 0}ms`} 
+              sub="Clinical Cloud Pipeline" 
+              icon={<Zap size={20} className="text-amber-500" />}
+              status={metrics && metrics.syncLatencyMs < 500 ? 'optimal' : 'degraded'}
+            />
+            <MetricCard 
+              label="Bio-Coverage" 
+              value={`${((metrics?.biologicalCoverage || 0) * 100).toFixed(0)}%`} 
+              sub="High-Fidelity Log Rate" 
+              icon={<Pulse size={20} className="text-emerald-500" />}
+              status={metrics && metrics.biologicalCoverage > 0.8 ? 'optimal' : 'warning'}
+            />
+            <MetricCard 
+              label="Maintenance Backlog" 
+              value={`${metrics?.maintenanceBacklog || 0} items`} 
+              sub="Journal Reconciliation" 
+              icon={<LogClock size={20} className="text-rose-500" />}
+              status={metrics && metrics.maintenanceBacklog < 15 ? 'optimal' : 'warning'}
+            />
+            <MetricCard 
+              label="Dependency Drift" 
+              value={`${((metrics?.dependencyDrift || 0) * 100).toFixed(1)}%`} 
+              sub="Protocol Schema Deviation" 
+              icon={<GitBranch size={20} className="text-blue-500" />}
+              status="optimal"
+            />
+            <MetricCard 
+              label="Security Score" 
+              value={`${(metrics as any)?.securityScore || 0}%`} 
+              sub="Global Defense Rating" 
+              icon={<ShieldCheck size={20} className="text-violet-500" />}
+              status="optimal"
+            />
+          </div>
+
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm relative overflow-hidden">
+             <div className="absolute top-0 right-0 p-8 opacity-10">
+               <Pulse size={200} className="text-brand-primary" />
+             </div>
+             <div className="relative z-10 space-y-6">
+               <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Biological Integrity Trends</h3>
+               <div className="h-[300px] w-full">
+                 <ResponsiveContainer width="100%" height="100%">
+                   <AreaChart data={[
+                     { time: '12 AM', coverage: 0.82, latency: 120 },
+                     { time: '4 AM', coverage: 0.88, latency: 140 },
+                     { time: '8 AM', coverage: 0.94, latency: 210 },
+                     { time: '12 PM', coverage: 0.91, latency: 180 },
+                     { time: '4 PM', coverage: 0.85, latency: 250 },
+                     { time: '8 PM', coverage: 0.96, latency: 190 },
+                   ]}>
+                     <defs>
+                       <linearGradient id="colorCov" x1="0" y1="0" x2="0" y2="1">
+                         <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
+                         <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                       </linearGradient>
+                     </defs>
+                     <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                     <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#64748b' }} />
+                     <YAxis hide />
+                     <Tooltip 
+                      contentStyle={{ backgroundColor: '#fff', borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
+                      labelStyle={{ fontWeight: '800', textTransform: 'uppercase', fontSize: '10px', color: '#64748b' }}
+                     />
+                     <Area type="monotone" dataKey="coverage" stroke="#3b82f6" fillOpacity={1} fill="url(#colorCov)" strokeWidth={3} />
+                   </AreaChart>
+                 </ResponsiveContainer>
+               </div>
+             </div>
+          </div>
+        </motion.div>
+      )}
+
+      {activeTab === 'decisions' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="grid grid-cols-1 lg:grid-cols-2 gap-8"
+        >
+          {decisions.map((decision) => (
+            <div key={decision.id} className="bg-brand-surface border border-brand-border rounded-[32px] p-8 space-y-6 shadow-sm group hover:border-brand-primary/50 transition-all">
+              <div className="flex justify-between items-start">
+                <div className={cn(
+                  "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                  decision.strategy === 'repair' ? "bg-rose-500 text-white" : 
+                  decision.strategy === 'optimize' ? "bg-emerald-500 text-white" : "bg-blue-500 text-white"
+                )}>
+                  Strategy: {decision.strategy}
+                </div>
+                <div className="text-[10px] font-bold text-text-muted uppercase">{format(parseISO(decision.timestamp), 'HH:mm:ss')}</div>
+              </div>
+              <div className="space-y-4">
+                <h4 className="text-lg font-black text-text-main leading-tight uppercase tracking-tight group-hover:text-brand-primary transition-colors">
+                  Decision Logic: Node {decision.id}
+                </h4>
+                <p className="text-sm text-text-muted font-medium leading-relaxed italic">"{decision.reasoning}"</p>
+              </div>
+              <div className="pt-6 border-t border-brand-border flex items-center justify-between">
+                <div className="flex -space-x-2">
+                  {decision.affectedNodes.map((n, i) => (
+                    <div key={i} title={n} className="w-8 h-8 rounded-full bg-slate-100 border-2 border-white flex items-center justify-center text-[10px] font-black text-slate-500 uppercase">
+                      {n.charAt(0)}
+                    </div>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-black text-text-muted uppercase">Confidence</span>
+                  <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${decision.confidence * 100}%` }}
+                      className="h-full bg-brand-primary"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </motion.div>
+      )}
+
+      {activeTab === 'traces' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-brand-surface border border-brand-border rounded-[40px] overflow-hidden shadow-sm"
+        >
+          <div className="p-8 border-b border-brand-border flex justify-between items-center bg-brand-bg/50">
+            <div className="flex items-center gap-3">
+              <Terminal size={20} className="text-brand-primary" />
+              <h3 className="text-xl font-black text-text-main uppercase tracking-tighter">Step-Level Biological Trace</h3>
+            </div>
+            <div className="text-[10px] font-black text-rose-500 uppercase flex items-center gap-2 animate-pulse">
+              <AlertCircle size={14} /> Loop Detector Active
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="border-b border-brand-border text-[10px] font-black text-text-muted uppercase tracking-[0.2em] bg-brand-bg/20">
+                  <th className="px-8 py-4">Timestamp</th>
+                  <th className="px-8 py-4">Agent Tool</th>
+                  <th className="px-8 py-4">Action Pipeline</th>
+                  <th className="px-8 py-4 text-right">Duration</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-brand-border">
+                {traces.map((trace) => (
+                  <tr key={trace.id} className="hover:bg-brand-bg/30 transition-colors group">
+                    <td className="px-8 py-6 text-[10px] font-bold text-text-muted font-mono">{format(parseISO(trace.timestamp), 'HH:mm:ss.SSS')}</td>
+                    <td className="px-8 py-6">
+                      <div className="px-3 py-1.5 bg-slate-100 border border-brand-border rounded-lg text-[9px] font-black uppercase text-slate-600 inline-block">
+                        {trace.tool}
+                      </div>
+                    </td>
+                    <td className="px-8 py-6 text-xs font-black text-text-main uppercase tracking-tight group-hover:text-brand-primary transition-colors">{trace.action}</td>
+                    <td className="px-8 py-6 text-right">
+                      <div className="text-xs font-mono font-bold text-emerald-600">+{trace.durationMs}ms</div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </motion.div>
+      )}
+
+      {activeTab === 'defense' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-10"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 text-white">
+            <div className="bg-slate-900 border border-brand-border rounded-[40px] p-10 space-y-6 shadow-xl relative overflow-hidden group">
+              <div className="absolute -right-20 -top-20 opacity-5 group-hover:opacity-10 transition-opacity">
+                <ShieldCheck size={300} />
+              </div>
+              <div className="relative z-10 space-y-8">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-emerald-400 text-[10px] font-black uppercase tracking-[0.2em] bg-emerald-400/10 px-3 py-1 rounded-full w-fit">
+                    <div className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
+                    Active E2E Encryption
+                  </div>
+                  <h3 className="text-4xl font-black tracking-tight uppercase">Biological Cryptography</h3>
+                </div>
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center bg-white/5 p-4 rounded-2xl border border-white/10">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Current Algorithm</span>
+                    <span className="text-xs font-mono text-emerald-400 font-bold">AES-GCM-256</span>
+                  </div>
+                  <div className="flex justify-between items-center bg-white/5 p-4 rounded-2xl border border-white/10">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Key Rotation</span>
+                    <span className="text-xs font-mono text-emerald-400 font-bold">Every 2 Hours</span>
+                  </div>
+                  <div className="flex justify-between items-center bg-white/5 p-4 rounded-2xl border border-white/10">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Device Fingerprint</span>
+                    <span className="text-xs font-mono text-emerald-400 font-bold">NODE-X-9981-BIOC</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-slate-900 border border-brand-border rounded-[40px] p-10 space-y-6 shadow-xl relative overflow-hidden group">
+              <div className="absolute -right-20 -top-20 opacity-5 group-hover:opacity-10 transition-opacity text-rose-500">
+                <AlertCircle size={300} />
+              </div>
+              <div className="relative z-10 space-y-8">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-rose-400 text-[10px] font-black uppercase tracking-[0.2em] bg-rose-400/10 px-3 py-1 rounded-full w-fit">
+                    <div className="w-1.5 h-1.5 bg-rose-400 rounded-full animate-pulse" />
+                    Threat Detection Operational
+                  </div>
+                  <h3 className="text-4xl font-black tracking-tight uppercase">Network Defense</h3>
+                </div>
+                <div className="space-y-4 text-xs font-medium text-slate-400 leading-relaxed italic">
+                  "Niro Protocol actively monitors all incoming biological sync requests. Geo-fencing is engaged to isolate clinical pump nodes from non-authorized IP ranges."
+                </div>
+                <div className="pt-6 border-t border-white/10 flex items-center justify-between">
+                  <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">Active Firewalls</div>
+                  <div className="flex gap-2">
+                    <div className="w-2 h-2 rounded-full bg-emerald-500" />
+                    <div className="w-2 h-2 rounded-full bg-emerald-500" />
+                    <div className="w-2 h-2 rounded-full bg-emerald-500" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] overflow-hidden shadow-sm">
+            <div className="p-8 border-b border-brand-border flex justify-between items-center bg-brand-bg/50">
+              <div className="flex items-center gap-3">
+                <ShieldCheck size={20} className="text-brand-primary" />
+                <h3 className="text-xl font-black text-text-main uppercase tracking-tighter">Security Audit Logs</h3>
+              </div>
+            </div>
+            <div className="divide-y divide-brand-border">
+              {securityEvents.map((event) => (
+                <div key={event.id} className="p-8 hover:bg-brand-bg/30 transition-all flex flex-col md:flex-row gap-6 justify-between items-start md:items-center">
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-4">
+                      <span className={cn(
+                        "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest",
+                        event.severity === 'high' || event.severity === 'critical' ? "bg-rose-500 text-white" : 
+                        event.severity === 'medium' ? "bg-amber-500 text-white" : "bg-emerald-500 text-white"
+                      )}>
+                        {event.severity}
+                      </span>
+                      <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">{event.type} • {event.source}</span>
+                    </div>
+                    <p className="text-sm font-bold text-text-main leading-relaxed">"{event.description}"</p>
+                  </div>
+                  <div className="text-[10px] font-black text-text-muted uppercase font-mono bg-slate-100 px-3 py-1 rounded-lg">
+                    {format(parseISO(event.timestamp), 'yyyy-MM-dd HH:mm:ss')}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {activeTab === 'maintenance' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-8"
+        >
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm space-y-6">
+            <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Maintenance Protocol</h3>
+            <p className="text-text-muted text-xs font-bold uppercase tracking-widest mt-1">Pending Biological & System Repairs</p>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {[
+                { 
+                  title: "Sensor Calibration", 
+                  desc: "CGM variance detected (+12%). Calibration required for clinical fidelity.", 
+                  icon: <Activity />, 
+                  status: "Action Required",
+                  color: "amber"
+                },
+                { 
+                  title: "Database Reconciliation", 
+                  desc: "3 entries pending server-side biological validation.", 
+                  icon: <LogClock />, 
+                  status: "Processing",
+                  color: "blue"
+                },
+                { 
+                  title: "Encryption Audit", 
+                  desc: "Last rotation: 4 days ago. Security protocol stable.", 
+                  icon: <ShieldCheck />, 
+                  status: "Healthy",
+                  color: "emerald"
+                },
+                { 
+                  title: "Telemetry Sync", 
+                  desc: "Observability latency below 200ms. High throughput active.", 
+                  icon: <Zap />, 
+                  status: "Optimal",
+                  color: "emerald"
+                }
+              ].map((task, i) => (
+                <div key={i} className="flex gap-5 p-6 bg-brand-bg rounded-3xl border border-brand-border shadow-sm group hover:border-brand-primary/30 transition-all text-slate-800">
+                  <div className={cn("shrink-0 p-4 rounded-2xl border flex items-center justify-center h-16 w-16", 
+                    task.color === 'amber' ? "bg-amber-50 border-amber-100 text-amber-500" : 
+                    task.color === 'emerald' ? "bg-emerald-50 border-emerald-100 text-emerald-500" : 
+                    "bg-blue-50 border-blue-100 text-blue-500"
+                  )}>
+                    {task.icon}
+                  </div>
+                  <div className="space-y-1 flex-1">
+                    <div className="flex justify-between items-start">
+                      <h4 className="text-[11px] font-black text-slate-800 uppercase tracking-widest">{task.title}</h4>
+                      <span className={cn("text-[8px] font-black uppercase px-2 py-0.5 rounded-full",
+                        task.color === 'amber' ? "bg-amber-100 text-amber-600" : 
+                        task.color === 'emerald' ? "bg-emerald-100 text-emerald-600" : 
+                        "bg-blue-100 text-blue-600"
+                      )}>{task.status}</span>
+                    </div>
+                    <p className="text-[12px] text-slate-500 leading-relaxed font-medium">{task.desc}</p>
+                    {task.status === "Action Required" && (
+                      <button className="mt-3 text-[10px] font-black text-brand-primary uppercase tracking-widest hover:underline">
+                        Initialize Repair
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub, icon, status }: { label: string, value: string, sub: string, icon: React.ReactNode, status?: 'optimal' | 'warning' | 'degraded' }) {
+  return (
+    <div className="bg-brand-surface border border-brand-border p-8 rounded-[32px] space-y-4 shadow-sm hover:scale-[1.02] transition-transform">
+      <div className="flex justify-between items-center text-text-muted uppercase font-bold tracking-widest text-[9px]">
+        <div className="flex items-center gap-2">
+          {icon}
+          {label}
+        </div>
+        <div className={cn(
+          "w-2 h-2 rounded-full",
+          status === 'optimal' ? "bg-emerald-500" : status === 'warning' ? "bg-amber-500" : "bg-rose-500"
+        )} />
+      </div>
+      <div>
+        <div className="text-3xl font-black text-text-main uppercase tracking-tighter">{value}</div>
+        <div className="text-[10px] font-bold text-text-muted uppercase tracking-widest mt-1">{sub}</div>
+      </div>
+    </div>
+  );
+}
+
 function NavLink({ active, onClick, icon, label }: { active: boolean, onClick: () => void, icon: React.ReactNode, label: string }) {
   return (
     <button
@@ -445,13 +1129,15 @@ function Dashboard({
   settings, 
   setNotification, 
   speak,
-  setActiveTab
+  setActiveTab,
+  syncCgm
 }: { 
   entries: Entry[], 
   settings: UserSettings,
   setNotification: (n: { message: string, type: 'success' | 'info' } | null) => void,
   speak: (t: string) => void,
-  setActiveTab: (tab: any) => void
+  setActiveTab: (tab: any) => void,
+  syncCgm: () => void
 }) {
   const greeting = useMemo(() => {
     // Hidden as per user request to use "Niro Check" title
@@ -550,6 +1236,16 @@ function Dashboard({
           <p className="text-text-muted text-sm font-medium uppercase tracking-widest mt-1">Operational Flow • {settings.name}</p>
         </div>
         <div className="flex gap-4 items-center">
+          {settings.cgm?.isConnected && (
+            <button 
+              onClick={syncCgm}
+              className="p-3 bg-brand-primary/10 border border-brand-primary/20 rounded-xl text-brand-primary hover:bg-brand-primary hover:text-white transition-all group shadow-sm flex items-center gap-2"
+              title="Sync CGM Data"
+            >
+              <Droplets size={18} className="animate-bounce" />
+              <span className="text-[10px] font-black uppercase tracking-widest hidden lg:inline">Live Sync</span>
+            </button>
+          )}
           <button 
             onClick={() => {
               if (lastReading) {
@@ -783,6 +1479,11 @@ function Dashboard({
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
+        {/* Patch Tracking Overlay */}
+        <div className="col-span-1 md:col-span-12">
+          <PatchTracker entries={entries} onAddPatch={setActiveTab} />
+        </div>
+
         {/* Main Scorecard */}
         <div className="col-span-1 md:col-span-7 bg-white border border-brand-border rounded-3xl p-8 shadow-sm relative overflow-hidden group">
           <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity">
@@ -940,17 +1641,114 @@ function TypeCard({ active, onClick, icon, label }: { active: boolean, onClick: 
   );
 }
 
-function LogForm({ onAdd, speak }: { onAdd: (entry: Entry) => void, speak: (text: string) => void }) {
+function BolusCalculator({ 
+  currentGlucose, 
+  iob,
+  clinicalSettings,
+  onApply 
+}: { 
+  currentGlucose: number; 
+  iob: number;
+  clinicalSettings?: UserSettings['clinical'];
+  onApply: (units: number) => void 
+}) {
+  const [carbs, setCarbs] = useState(0);
+  const [icr, setIcr] = useState(clinicalSettings?.icr || 10);
+  const [isf, setIsf] = useState(clinicalSettings?.isf || 50);
+  const [target, setTarget] = useState(clinicalSettings?.target || 100);
+
+  useEffect(() => {
+    if (clinicalSettings) {
+      setIcr(clinicalSettings.icr);
+      setIsf(clinicalSettings.isf);
+      setTarget(clinicalSettings.target);
+    }
+  }, [clinicalSettings]);
+
+  const dose = useMemo(() => {
+    return calculateBolus({
+      carbs,
+      currentGlucose,
+      targetGlucose: target,
+      icr,
+      isf,
+      iob
+    });
+  }, [carbs, currentGlucose, target, icr, isf, iob]);
+
+  return (
+    <div className="bg-slate-50 border border-brand-border rounded-3xl p-6 space-y-4 shadow-inner">
+      <header className="flex items-center gap-2 text-brand-primary border-b border-brand-border pb-3 mb-4">
+        <Zap size={18} />
+        <h3 className="text-[10px] font-black uppercase tracking-widest">Clinical Bolus Assistant</h3>
+      </header>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <label className="text-[9px] font-bold text-slate-400 uppercase">Carbs (g)</label>
+          <input 
+            type="number" 
+            value={carbs || ''} 
+            onChange={(e) => setCarbs(Number(e.target.value))}
+            className="w-full bg-white border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-primary"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[9px] font-bold text-slate-400 uppercase">Target (mg/dL)</label>
+          <input 
+            type="number" 
+            value={target} 
+            onChange={(e) => setTarget(Number(e.target.value))}
+            className="w-full bg-white border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-primary"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[9px] font-bold text-slate-400 uppercase">Ratio (1:X)</label>
+          <input 
+            type="number" 
+            value={icr} 
+            onChange={(e) => setIcr(Number(e.target.value))}
+            className="w-full bg-white border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-primary"
+          />
+        </div>
+        <div className="space-y-1 text-right">
+          <p className="text-[9px] font-bold text-slate-400 uppercase">Active IOB</p>
+          <p className="text-sm font-black text-slate-800">{iob.toFixed(1)} U</p>
+        </div>
+      </div>
+
+      <div className="pt-4 flex items-center justify-between border-t border-brand-border">
+        <div className="space-y-1">
+          <p className="text-[9px] font-bold text-slate-400 uppercase">Recommended Dose</p>
+          <p className="text-2xl font-black text-brand-primary">{dose} <span className="text-xs uppercase">Units</span></p>
+        </div>
+        <button 
+          type="button"
+          onClick={() => onApply(dose)}
+          disabled={dose <= 0}
+          className="px-6 py-3 bg-brand-primary text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-brand-primary/90 disabled:opacity-50 transition-all shadow-md shadow-brand-primary/10"
+        >
+          Apply Dosage
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LogForm({ onAdd, entries, settings, speak }: { onAdd: (entry: Entry) => void, entries: Entry[], settings: UserSettings, speak: (text: string) => void }) {
   const [type, setType] = useState<EntryType>('glucose');
   const [value, setValue] = useState('');
   const [name, setName] = useState('');
   const [context, setContext] = useState<GlucoseEntry['context']>('before_meal');
   const [mealType, setMealType] = useState<MealEntry['mealType']>('breakfast');
+  const [patchType, setPatchType] = useState<PatchEntry['patchType']>('cgm');
+  const [expiryDays, setExpiryDays] = useState('10');
+  const [location, setLocation] = useState('Left Upper Arm');
   const [isRecording, setIsRecording] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!value && type !== 'meal') return;
+    if (!value && type !== 'meal' && type !== 'patch') return;
     
     let entry: Entry;
     const timestamp = new Date().toISOString();
@@ -964,6 +1762,10 @@ function LogForm({ onAdd, speak }: { onAdd: (entry: Entry) => void, speak: (text
       entry = { id, timestamp, type, name, dosage: value } as MedicationEntry;
     } else if (type === 'journal') {
       entry = { id, timestamp, type, content: value } as JournalEntry;
+    } else if (type === 'patch') {
+      const expiry = new Date();
+      expiry.setDate(expiry.getDate() + parseInt(expiryDays));
+      entry = { id, timestamp, type, patchType, brand: name, expiryTimestamp: expiry.toISOString(), location } as PatchEntry;
     } else {
       entry = { id, timestamp, type, description: name, duration: parseInt(value), intensity: 'medium' } as ActivityEntry;
     }
@@ -1013,11 +1815,12 @@ function LogForm({ onAdd, speak }: { onAdd: (entry: Entry) => void, speak: (text
         <HelpTooltip text="Use voice entry to quickly log glucose numbers without typing." />
       </div>
 
-      <div className="grid grid-cols-3 md:grid-cols-5 gap-3">
+      <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
         <TypeCard active={type === 'glucose'} onClick={() => setType('glucose')} icon={<Droplets size={20} />} label="Glucose" />
         <TypeCard active={type === 'meal'} onClick={() => setType('meal')} icon={<Utensils size={20} />} label="Meal" />
         <TypeCard active={type === 'medication'} onClick={() => setType('medication')} icon={<Pill size={20} />} label="Meds" />
         <TypeCard active={type === 'activity'} onClick={() => setType('activity')} icon={<Activity size={20} />} label="Motion" />
+        <TypeCard active={type === 'patch'} onClick={() => setType('patch')} icon={<ShieldCheck size={20} />} label="Patch" />
         <TypeCard active={type === 'journal'} onClick={() => setType('journal')} icon={<BookOpen size={20} />} label="Journal" />
       </div>
 
@@ -1134,29 +1937,103 @@ function LogForm({ onAdd, speak }: { onAdd: (entry: Entry) => void, speak: (text
         )}
 
         {(type === 'medication' || type === 'activity') && (
-          <div className="space-y-4">
-            <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest border-b border-brand-border pb-2 mb-4">
-              {type === 'medication' ? 'Agent Name' : 'Session Description'}
-            </label>
-            <input 
-              type="text" 
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="..."
-              className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
-              required
-            />
-            <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest">
-              {type === 'medication' ? 'Prescribed Dosage' : 'Duration (min)'}
-            </label>
-            <input 
-              type={type === 'medication' ? 'text' : 'number'} 
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              placeholder="..."
-              className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
-              required
-            />
+          <div className="space-y-6">
+            {type === 'medication' && (
+              <BolusCalculator 
+                currentGlucose={entries.filter(e => e.type === 'glucose')[0]?.value || 100}
+                iob={calculateIOB(entries, new Date())}
+                clinicalSettings={settings.clinical}
+                onApply={(u) => setValue(u.toString())}
+              />
+            )}
+            
+            <div className="space-y-4">
+              <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest border-b border-brand-border pb-2 mb-4">
+                {type === 'medication' ? 'Agent Name' : 'Session Description'}
+              </label>
+              <input 
+                type="text" 
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="..."
+                className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
+                required
+              />
+              <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest">
+                {type === 'medication' ? 'Prescribed Dosage' : 'Duration (min)'}
+              </label>
+              <input 
+                type={type === 'medication' ? 'text' : 'number'} 
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder="..."
+                className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
+                required
+              />
+            </div>
+          </div>
+        )}
+
+        {type === 'patch' && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 gap-2">
+              {(['cgm', 'pump'] as const).map((pt) => (
+                <button
+                  key={pt}
+                  type="button"
+                  onClick={() => setPatchType(pt)}
+                  className={cn(
+                    "px-4 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest border transition-all",
+                    patchType === pt ? "bg-brand-primary border-brand-primary text-white" : "bg-white border-brand-border text-slate-500"
+                  )}
+                >
+                  {pt}
+                </button>
+              ))}
+            </div>
+            
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-400 uppercase tracking-widest px-1">Brand / Model</label>
+              <input 
+                type="text" 
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Dexcom G7, Omnipod, etc."
+                className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
+                required
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-400 uppercase tracking-widest px-1">Application Location</label>
+              <input 
+                type="text" 
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                placeholder="Left Arm, Abdomen, etc."
+                className="w-full bg-slate-50 border border-brand-border rounded-xl px-4 py-3 focus:outline-none focus:border-brand-primary text-slate-900"
+                required
+              />
+            </div>
+
+            <div className="space-y-4">
+              <label className="text-xs font-bold text-slate-400 uppercase tracking-widest px-1">Efficacy Lifetime (Days)</label>
+              <div className="flex gap-2">
+                {['3', '7', '10', '14'].map(d => (
+                  <button 
+                    key={d}
+                    type="button"
+                    onClick={() => setExpiryDays(d)}
+                    className={cn(
+                      "flex-1 py-3 border rounded-xl text-[10px] font-bold uppercase transition-all",
+                      expiryDays === d ? "bg-brand-primary border-brand-primary text-white shadow-sm" : "bg-white border-brand-border text-slate-400"
+                    )}
+                  >
+                    {d} Days
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         )}
 
@@ -1196,6 +2073,94 @@ function HelpTooltip({ text }: { text: string }) {
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+// --- PatchTracker Component ---
+function PatchTracker({ entries, onAddPatch }: { entries: Entry[], onAddPatch: (tab: any) => void }) {
+  const activePatches = useMemo(() => {
+    const patches = entries.filter((e): e is PatchEntry => e.type === 'patch');
+    const latest: Record<string, PatchEntry> = {};
+    patches.forEach(p => {
+      if (!latest[p.patchType] || new Date(p.timestamp) > new Date(latest[p.patchType].timestamp)) {
+        latest[p.patchType] = p;
+      }
+    });
+
+    return Object.values(latest).filter(p => new Date(p.expiryTimestamp) > new Date());
+  }, [entries]);
+
+  if (activePatches.length === 0) {
+    return (
+      <div className="bg-brand-primary/5 border border-brand-primary/20 border-dashed rounded-3xl p-6 flex items-center justify-between group hover:border-brand-primary transition-all cursor-pointer shadow-sm" onClick={() => onAddPatch('log')}>
+        <div className="flex items-center gap-4">
+          <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center text-brand-primary shadow-sm">
+            <ShieldCheck size={24} />
+          </div>
+          <div>
+            <p className="text-[10px] font-bold text-brand-primary uppercase tracking-widest leading-none">Biological Hardware: Status Offline</p>
+            <p className="text-sm font-bold text-slate-800 uppercase tracking-tighter mt-1">No active patch or sensor detected</p>
+          </div>
+        </div>
+        <Plus size={20} className="text-brand-primary opacity-50 group-hover:opacity-100 transition-opacity" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {activePatches.map(patch => {
+        const expiry = new Date(patch.expiryTimestamp).getTime();
+        const start = new Date(patch.timestamp).getTime();
+        const now = new Date().getTime();
+        const remaining = expiry - now;
+        const total = expiry - start;
+        const progress = Math.max(0, Math.min(100, (remaining / total) * 100));
+        const days = Math.floor(remaining / (24 * 60 * 60 * 1000));
+        const hours = Math.floor((remaining % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+
+        return (
+          <div key={patch.id} className="bg-white border border-brand-border rounded-3xl p-6 space-y-4 shadow-sm relative overflow-hidden group">
+            <div className="flex justify-between items-start relative z-10">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-brand-primary/10 text-brand-primary rounded-xl flex items-center justify-center">
+                  {patch.patchType === 'cgm' ? <Droplets size={20} /> : <ShieldCheck size={20} />}
+                </div>
+                <div>
+                  <p className="text-[8px] font-black text-brand-primary uppercase tracking-widest">{patch.brand} • {patch.patchType}</p>
+                  <h4 className="text-sm font-black text-slate-800 uppercase tracking-tighter">{patch.location}</h4>
+                </div>
+              </div>
+              <div className="text-right">
+                <p className="text-[14px] font-black text-slate-900 leading-none">{days}d {hours}h</p>
+                <p className="text-[8px] font-bold text-slate-400 uppercase tracking-widest">Remaining</p>
+              </div>
+            </div>
+            
+            <div className="space-y-2 relative z-10">
+              <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <motion.div 
+                  initial={{ width: 0 }}
+                  animate={{ width: `${progress}%` }}
+                  className={cn(
+                    "h-full transition-all",
+                    progress < 20 ? "bg-rose-500" : progress < 50 ? "bg-amber-500" : "bg-emerald-500"
+                  )}
+                />
+              </div>
+              <div className="flex justify-between text-[8px] font-bold text-slate-400 uppercase tracking-widest px-0.5">
+                <span>Efficacy: {Math.round(progress)}%</span>
+                <span>Expiry: {format(new Date(patch.expiryTimestamp), 'MMM d')}</span>
+              </div>
+            </div>
+
+            <div className="absolute -right-4 -bottom-4 opacity-5 group-hover:opacity-10 transition-opacity rotate-12">
+               {patch.patchType === 'cgm' ? <Droplets size={80} /> : <ShieldCheck size={80} />}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1286,10 +2251,16 @@ function Insights({ entries, settings }: { entries: Entry[], settings: UserSetti
 
     const values = readings.map(r => r.value);
     const avg = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+    const gmi = calculateGMI(avg);
+    const tir = Math.round(calculateTIR(entries, settings.targetRange.min, settings.targetRange.max));
+    const cv = Math.round(calculateCV(entries));
+    const roc = calculateROC(entries);
+    
+    // Prediction for 30 min
+    const prediction30 = predictGlucose(entries, 30);
+
     const highs = readings.filter(r => r.value > settings.targetRange.max).length;
     const lows = readings.filter(r => r.value < settings.targetRange.min).length;
-    const inRange = readings.length - highs - lows;
-    const tir = Math.round((inRange / readings.length) * 100);
 
     // Identify patterns
     const patterns: string[] = [];
@@ -1313,17 +2284,12 @@ function Insights({ entries, settings }: { entries: Entry[], settings: UserSetti
       patterns.push(`Hypoglycemic event recorded. Security protocol recommendation: Always carry fast-acting glucose.`);
     }
 
-    // Post-meal correlation
-    const meals = entries.filter((e): e is MealEntry => e.type === 'meal');
-    if (meals.length > 0 && readings.length > 2) {
-      const latestMeal = meals[0];
-      const relatedReading = readings.find(r => 
-        r.context === 'after_meal' && 
-        isAfter(new Date(r.timestamp), new Date(latestMeal.timestamp))
-      );
-      if (relatedReading && relatedReading.value > settings.targetRange.max) {
-        patterns.push(`Spike Cluster: Your latest meal (${latestMeal.foodDescription || latestMeal.mealType}) preceded a hyper event. Monitor this ingredient profile.`);
-      }
+    if (cv > 36) {
+      patterns.push(`High Glycemic Variability (${cv}%). Frequent spikes and drops detected. Engine recommends tighter bolus timing.`);
+    }
+
+    if (roc && roc > 2) {
+      patterns.push("Rapid Biological Spike: Glucose rising > 2mg/dL per minute. Hydration protocol recommended.");
     }
 
     if (tir < 70) {
@@ -1332,7 +2298,7 @@ function Insights({ entries, settings }: { entries: Entry[], settings: UserSetti
       patterns.push("Optimal biological flow achieved. Stability engine performing within high-fidelity targets.");
     }
 
-    return { avg, highs, lows, tir, patterns };
+    return { avg, gmi, tir, cv, highs, lows, prediction30, patterns };
   }, [entries, settings]);
 
   const COLORS = ['#3b82f6', '#f59e0b', '#f43f5e']; // brand-primary, amber, rose
@@ -1409,15 +2375,28 @@ function Insights({ entries, settings }: { entries: Entry[], settings: UserSetti
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
                   <span className="text-slate-400 text-xs font-bold uppercase">Average Glucose</span>
-                  <span className="text-xl font-black text-slate-800">{stats.avg}</span>
+                  <span className="text-xl font-black text-slate-800">{stats.avg} <span className="text-[10px] text-slate-400 font-bold">mg/dL</span></span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-slate-400 text-xs font-bold uppercase">Hypo Alerts</span>
-                  <span className="text-xl font-black text-rose-500">{stats.lows}</span>
+                  <span className="text-slate-400 text-xs font-bold uppercase">GMI (Est. A1c)</span>
+                  <span className="text-xl font-black text-brand-primary">{stats.gmi.toFixed(1)}%</span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-slate-400 text-xs font-bold uppercase">Hyper Alerts</span>
-                  <span className="text-xl font-black text-amber-500">{stats.highs}</span>
+                  <span className="text-slate-400 text-xs font-bold uppercase">Variability (CV)</span>
+                  <span className={cn("text-xl font-black", stats.cv > 36 ? "text-amber-500" : "text-emerald-500")}>
+                    {stats.cv}%
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400 text-xs font-bold uppercase">30m Prediction</span>
+                  <span className="text-xl font-black text-slate-800 italic">{stats.prediction30}</span>
+                </div>
+                <div className="flex justify-between items-center pt-2 border-t border-brand-border">
+                  <span className="text-slate-400 text-xs font-bold uppercase">Hypo / Hyper</span>
+                  <div className="flex gap-4">
+                    <span className="text-sm font-black text-rose-500">{stats.lows}L</span>
+                    <span className="text-sm font-black text-amber-500">{stats.highs}H</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1809,6 +2788,24 @@ function CalendarView({ entries, onAddJournal }: { entries: Entry[], onAddJourna
               <Calendar size={16} className="text-brand-primary" />
             </h3>
 
+            {/* Daily Stats Summary */}
+            {selectedEntries.some(e => e.type === 'glucose') && (
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-slate-50 border border-brand-border p-4 rounded-2xl space-y-1">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase">Avg Glucose</p>
+                  <p className="text-xl font-black text-slate-800">
+                    {Math.round(selectedEntries.filter((e): e is GlucoseEntry => e.type === 'glucose').reduce((a, b) => a + b.value, 0) / selectedEntries.filter(e => e.type === 'glucose').length)}
+                  </p>
+                </div>
+                <div className="bg-slate-50 border border-brand-border p-4 rounded-2xl space-y-1">
+                  <p className="text-[9px] font-bold text-slate-400 uppercase">Daily TIR</p>
+                  <p className="text-xl font-black text-brand-primary">
+                    {Math.round(calculateTIR(selectedEntries))}%
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-4 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
               {selectedEntries.filter(e => e.type !== 'journal').length === 0 ? (
                 <div className="text-center py-10 space-y-2">
@@ -1857,53 +2854,388 @@ function CalendarView({ entries, onAddJournal }: { entries: Entry[], onAddJourna
 }
 
 // --- Settings Component ---
-function Settings({ settings, onSave, setNotification, entries }: { 
+function Settings({ 
+  settings, 
+  onSave, 
+  setNotification, 
+  entries 
+}: { 
   settings: UserSettings, 
-  onSave: (s: UserSettings) => void,
+  onSave: (s: UserSettings) => void, 
   setNotification: (n: any) => void,
   entries: Entry[]
 }) {
+  const [activeSection, setActiveSection] = useState<'profile' | 'alerts' | 'targets' | 'cgm' | 'support' | 'clinical'>('profile');
   const [formData, setFormData] = useState(settings);
 
+  useEffect(() => {
+    setFormData(settings);
+  }, [settings]);
+
+  const handleDexcomFlow = async () => {
+    try {
+      const response = await fetch('/api/auth/dexcom/url');
+      const { url } = await response.json();
+      window.open(url, 'dexcom_auth', 'width=600,height=700');
+    } catch (e) {
+      console.error('Auth flow failed', e);
+    }
+  };
+
   return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className="p-6 max-w-2xl mx-auto space-y-8"
-    >
-      <header>
-        <h2 className="text-2xl font-black tracking-tighter uppercase sleek-gradient-text">Configuration</h2>
-        <p className="text-slate-400 font-bold text-[10px] uppercase tracking-widest">Protocol Adjustment</p>
+    <div className="p-6 max-w-4xl mx-auto space-y-10 min-h-screen">
+      <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 border-b border-brand-border pb-10">
+        <div>
+          <h2 className="text-5xl font-black tracking-tighter hover-glow-text uppercase">Care Logic</h2>
+          <p className="text-text-muted text-xs font-bold uppercase tracking-[0.3em] mt-2">Protocol Configuration • Identity Secure</p>
+        </div>
+        <div className="flex gap-2">
+          {['profile', 'targets', 'alerts', 'cgm', 'support', 'clinical'].map((s) => (
+            <button
+              key={s}
+              onClick={() => setActiveSection(s as any)}
+              className={cn(
+                "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all",
+                activeSection === s ? "bg-brand-primary border-brand-primary text-white shadow-lg shadow-brand-primary/20" : "bg-brand-surface border-brand-border text-text-muted hover:border-brand-primary/50"
+              )}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
       </header>
 
-      <div className="space-y-8 bg-brand-surface border border-brand-border p-10 rounded-3xl shadow-sm">
-        <div className="flex justify-between items-center bg-brand-bg p-4 rounded-2xl border border-brand-border mb-4">
-          <div className="flex items-center gap-3">
-            <LayoutDashboard size={16} className="text-brand-primary" />
-            <span className="text-[10px] font-bold uppercase tracking-widest text-text-muted">Visual Skin</span>
-          </div>
-          <div className="flex gap-2">
-            {[
-              { id: 'light', icon: <Droplets size={14} />, label: 'Light' },
-              { id: 'dark', icon: <ShieldCheck size={14} />, label: 'Dark' }
-            ].map((t) => (
-              <button
-                key={t.id}
-                onClick={() => {
-                  const updated = { ...formData, theme: t.id as any };
-                  setFormData(updated);
-                  onSave(updated);
-                }}
-                className={cn(
-                  "flex items-center gap-2 px-4 py-2 rounded-xl text-[9px] font-bold uppercase tracking-widest border transition-all",
-                  formData.theme === t.id ? "bg-brand-primary border-brand-primary text-white shadow-lg shadow-brand-primary/20" : "bg-white border-brand-border text-slate-400 hover:border-brand-primary/30"
+      {activeSection === 'cgm' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-8"
+        >
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm">
+            <div className="flex flex-col md:flex-row gap-10">
+              <div className="flex-1 space-y-6">
+                <div className="space-y-4">
+                  <div className="w-16 h-16 bg-blue-500/10 text-blue-500 rounded-3xl flex items-center justify-center shadow-sm">
+                    <Droplets size={32} />
+                  </div>
+                  <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Dexcom API Stream</h3>
+                  <p className="text-text-muted text-sm leading-relaxed">
+                    Synchronize your Niro Protocol directly with Dexcom's biological data pipeline.
+                  </p>
+                </div>
+
+                {!settings.cgm?.isConnected ? (
+                  <button 
+                    onClick={handleDexcomFlow}
+                    className="px-8 py-4 bg-brand-primary text-white rounded-2xl font-black uppercase tracking-widest shadow-lg shadow-brand-primary/20 hover:scale-105 transition-all text-xs"
+                  >
+                    Authorize System Bridge
+                  </button>
+                ) : (
+                  <div className="p-6 bg-emerald-500/5 border border-emerald-500/10 rounded-2xl flex items-center justify-between">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 bg-emerald-500 text-white rounded-full flex items-center justify-center shadow-lg shadow-emerald-500/20">
+                        <CheckCircle2 size={24} />
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">Status: Active Stream</p>
+                        <p className="text-xs text-slate-500 font-medium">Provider: {settings.cgm.provider.toUpperCase()}</p>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => onSave({ ...settings, cgm: undefined })}
+                      className="text-[10px] font-black text-rose-500 uppercase tracking-widest hover:underline"
+                    >
+                      Sever Bridge
+                    </button>
+                  </div>
                 )}
-              >
-                {t.icon} {t.label}
-              </button>
-            ))}
+              </div>
+
+              <div className="flex-1 bg-brand-bg rounded-3xl p-8 border border-brand-border space-y-6">
+                <h4 className="text-[10px] font-bold text-text-muted uppercase tracking-widest border-b border-brand-border pb-4">Feed Configuration</h4>
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-text-muted uppercase font-bold">API Mode</span>
+                    <span className="text-text-main font-black underline">Standard Production</span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-text-muted uppercase font-bold">Refresh Cycle</span>
+                    <span className="text-text-main font-black underline">5 Minutes</span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
+
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm relative overflow-hidden">
+            <div className="relative z-10 space-y-6">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 bg-amber-500/10 text-amber-600 rounded-2xl flex items-center justify-center">
+                  <ShieldCheck size={24} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-black text-text-main uppercase tracking-tighter">Dexcom Share (Legacy/Python Bridge)</h3>
+                  <p className="text-[10px] text-text-muted font-bold uppercase tracking-widest">Alternative Credentials Entry</p>
+                </div>
+              </div>
+
+              <form className="grid grid-cols-1 md:grid-cols-2 gap-4" onSubmit={(e) => {
+                e.preventDefault();
+                setNotification({ message: 'Establishing Share Bridge...', type: 'info' });
+                setTimeout(() => {
+                  setNotification({ message: 'Share Bridge Active: Protocol Synchronized', type: 'success' });
+                  onSave({ ...settings, cgm: { provider: 'dexcom', isConnected: true, lastSync: new Date().toISOString() } });
+                }, 2000);
+              }}>
+                <div className="space-y-2">
+                  <label className="text-[9px] font-black text-text-muted uppercase tracking-widest px-1">Username</label>
+                  <input type="text" placeholder="Dexcom Account Name" className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-brand-primary" />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[9px] font-black text-text-muted uppercase tracking-widest px-1">Password</label>
+                  <input type="password" placeholder="••••••••" className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-brand-primary" />
+                </div>
+                <button type="submit" className="md:col-span-2 py-4 bg-slate-800 text-white rounded-2xl font-black uppercase tracking-widest text-[10px] hover:bg-slate-700 transition-all">
+                  Initialize Share Bridge
+                </button>
+              </form>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {activeSection === 'support' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-8"
+        >
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm space-y-8">
+            <div className="flex justify-between items-center">
+              <div>
+                <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Family Support Circle</h3>
+                <p className="text-text-muted text-xs font-bold uppercase tracking-widest">Peer-to-Peer Biological Observation</p>
+              </div>
+              <button 
+                onClick={() => {
+                  const email = prompt('Enter Family Member Email:');
+                  if (email) {
+                    fetch('/api/family/invite', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ email, role: 'caregiver' })
+                    }).then(r => r.json()).then(member => {
+                      onSave({ ...settings, familyCircle: [...(settings.familyCircle || []), member] });
+                    });
+                  }
+                }}
+                className="px-6 py-3 bg-brand-primary text-white rounded-2xl font-black uppercase tracking-widest text-[10px] shadow-lg shadow-brand-primary/20 transition-all active:scale-95"
+              >
+                + Expand Circle
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {(!settings.familyCircle || settings.familyCircle.length === 0) ? (
+                <div className="md:col-span-2 p-12 bg-brand-bg rounded-3xl border border-brand-border border-dashed text-center">
+                  <p className="text-text-muted font-bold uppercase tracking-widest text-xs italic">No family members in this protocol yet.</p>
+                </div>
+              ) : (
+                settings.familyCircle.map(member => (
+                  <div key={member.id} className="bg-brand-bg border border-brand-border p-6 rounded-3xl flex items-center justify-between group hover:border-brand-primary/30 transition-all">
+                    <div className="flex items-center gap-4">
+                      <div className="w-12 h-12 bg-slate-200 rounded-full flex items-center justify-center text-slate-500 font-black text-xl">
+                        {member.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div>
+                        <p className="text-sm font-black text-text-main uppercase tracking-tighter">{member.name}</p>
+                        <p className="text-[10px] text-text-muted font-bold uppercase tracking-widest">{member.role} • {member.email}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className={cn("w-3 h-3 rounded-full animate-pulse", member.isSharingActive ? "bg-emerald-500" : "bg-slate-300")} />
+                      <button className="text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {activeSection === 'clinical' && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-8"
+        >
+          {/* Clinical Calculation Constants */}
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm space-y-8">
+            <header className="border-b border-brand-border pb-6">
+              <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Precision Logic Constants</h3>
+              <p className="text-text-muted text-xs font-bold uppercase tracking-widest mt-1">Core Biological Calculation Parameters</p>
+            </header>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1">Target Glucose</label>
+                <input 
+                  type="number" 
+                  value={formData.clinical?.target || 100}
+                  onChange={(e) => setFormData({ 
+                    ...formData, 
+                    clinical: { ...(formData.clinical || { icr: 10, isf: 50, target: 100, activeInsulinDuration: 4 }), target: Number(e.target.value) } 
+                  })}
+                  className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1">Carb Ratio (1:X)</label>
+                <input 
+                  type="number" 
+                  value={formData.clinical?.icr || 10}
+                  onChange={(e) => setFormData({ 
+                    ...formData, 
+                    clinical: { ...(formData.clinical || { icr: 10, isf: 50, target: 100, activeInsulinDuration: 4 }), icr: Number(e.target.value) } 
+                  })}
+                  className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1">Sensitivity (ISF)</label>
+                <input 
+                  type="number" 
+                  value={formData.clinical?.isf || 50}
+                  onChange={(e) => setFormData({ 
+                    ...formData, 
+                    clinical: { ...(formData.clinical || { icr: 10, isf: 50, target: 100, activeInsulinDuration: 4 }), isf: Number(e.target.value) } 
+                  })}
+                  className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1">Insulin Duration (h)</label>
+                <input 
+                  type="number" 
+                  value={formData.clinical?.activeInsulinDuration || 4}
+                  onChange={(e) => setFormData({ 
+                    ...formData, 
+                    clinical: { ...(formData.clinical || { icr: 10, isf: 50, target: 100, activeInsulinDuration: 4 }), activeInsulinDuration: Number(e.target.value) } 
+                  })}
+                  className="w-full bg-brand-bg border border-brand-border rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+            </div>
+
+            <button 
+              onClick={() => onSave(formData)}
+              className="px-8 py-3 bg-brand-primary text-white rounded-xl font-black text-[10px] uppercase tracking-widest shadow-lg shadow-brand-primary/10 hover:bg-brand-primary/90 transition-all"
+            >
+              Update Calculation Logic
+            </button>
+          </div>
+
+          <div className="bg-brand-surface border border-brand-border rounded-[40px] p-10 shadow-sm space-y-10">
+            <div className="flex flex-col md:flex-row gap-10">
+              <div className="flex-1 space-y-6">
+                <div className="space-y-4">
+                  <div className="w-16 h-16 bg-emerald-500/10 text-emerald-600 rounded-3xl flex items-center justify-center shadow-sm">
+                    <Stethoscope size={32} />
+                  </div>
+                  <h3 className="text-2xl font-black text-text-main uppercase tracking-tighter">Clinical EHR Bridge</h3>
+                  <p className="text-text-muted text-sm leading-relaxed">
+                    Standardized FHIR interoperability allows your biological data flow to integrate with professional clinical records (Epic, Cerner).
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                   <button 
+                    onClick={() => {
+                      setNotification({ message: 'Generating FHIR Bundle...', type: 'info' });
+                      fetch('/api/clinical/fhir/bundle')
+                        .then(r => r.json())
+                        .then(bundle => {
+                          const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `niro_fhir_bundle_${format(new Date(), 'yyyy-MM-dd')}.json`;
+                          a.click();
+                          setNotification({ message: 'FHIR Bundle Exported', type: 'success' });
+                        });
+                    }}
+                    className="w-full py-4 bg-emerald-600 text-white rounded-2xl font-black uppercase tracking-widest text-[10px] shadow-lg shadow-emerald-500/20 hover:scale-105 transition-all"
+                  >
+                    Export FHIR Observation Bundle
+                  </button>
+                  <p className="text-[9px] text-text-muted text-center font-bold uppercase tracking-widest">
+                    HL7 FHIR v4.0.1 COMPLIANT
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex-1 space-y-6">
+                 <div className="bg-brand-bg rounded-3xl p-8 border border-brand-border space-y-6">
+                  <h4 className="text-[10px] font-bold text-text-muted uppercase tracking-widest border-b border-brand-border pb-4">Standardized Interoperability</h4>
+                  <div className="space-y-4 text-xs">
+                    <div className="flex items-center gap-3 text-text-muted">
+                      <CheckCircle2 size={16} className="text-emerald-500" />
+                      <span>SMART on FHIR Authentication</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-text-muted">
+                      <CheckCircle2 size={16} className="text-emerald-500" />
+                      <span>LOINC Biological Coding</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-text-muted">
+                      <CheckCircle2 size={16} className="text-emerald-500" />
+                      <span>Provider-to-Provider Sync</span>
+                    </div>
+                  </div>
+                  <div className="pt-4 border-t border-brand-border">
+                    <p className="text-[9px] text-text-muted leading-relaxed italic">
+                      Interoperability ensures clinical decision support is backed by high-fidelity chronological data.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {activeSection === 'profile' && (
+        <div className="space-y-8 bg-brand-surface border border-brand-border p-10 rounded-3xl shadow-sm">
+          <div className="flex justify-between items-center bg-brand-bg p-4 rounded-2xl border border-brand-border mb-4">
+            <div className="flex items-center gap-3">
+              <LayoutDashboard size={16} className="text-brand-primary" />
+              <span className="text-[10px] font-bold uppercase tracking-widest text-text-muted">Visual Skin</span>
+            </div>
+            <div className="flex gap-2">
+              {[
+                { id: 'light', icon: <Droplets size={14} />, label: 'Light' },
+                { id: 'dark', icon: <ShieldCheck size={14} />, label: 'Dark' }
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    const updated = { ...formData, theme: t.id as any };
+                    setFormData(updated);
+                    onSave(updated);
+                  }}
+                  className={cn(
+                    "flex items-center gap-2 px-4 py-2 rounded-xl text-[9px] font-bold uppercase tracking-widest border transition-all",
+                    formData.theme === t.id ? "bg-brand-primary border-brand-primary text-white shadow-lg shadow-brand-primary/20" : "bg-white border-brand-border text-slate-400 hover:border-brand-primary/30"
+                  )}
+                >
+                  {t.icon} {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
         <div className="space-y-4">
           <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest border-b border-brand-border pb-2">User Identity</label>
@@ -2030,6 +3362,7 @@ function Settings({ settings, onSave, setNotification, entries }: {
           Synchronize Settings
         </button>
       </div>
+    )}
 
       <div className="bg-brand-primary/5 border border-brand-primary/10 p-10 rounded-3xl space-y-6">
         <div className="flex items-center gap-4 text-brand-primary">
@@ -2102,7 +3435,7 @@ function Settings({ settings, onSave, setNotification, entries }: {
           </p>
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 

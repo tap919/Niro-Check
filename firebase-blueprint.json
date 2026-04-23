@@ -1,0 +1,91 @@
+{
+  "entities": {
+    "UserSettings": {
+      "title": "User Settings",
+      "description": "Global configuration and identity for the Niro Protocol user.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "targetRange": {
+          "type": "object",
+          "properties": {
+            "min": { "type": "number" },
+            "max": { "type": "number" }
+          }
+        },
+        "unit": { "type": "string", "enum": ["mg/dL", "mmol/L"] },
+        "theme": { "type": "string", "enum": ["light", "dark"] },
+        "alerts": { "type": "array", "items": { "$ref": "ScheduledAlert" } },
+        "cgm": { "$ref": "CgmConfig" },
+        "familyCircle": { "type": "array", "items": { "$ref": "FamilyMember" } },
+        "ehr": { "$ref": "EhrConfig" }
+      },
+      "required": ["name", "targetRange", "unit", "theme"]
+    },
+    "Entry": {
+      "title": "Health Entry",
+      "description": "A discrete biological or behavioral data point.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["glucose", "meal", "medication", "activity", "journal", "patch"] },
+        "notes": { "type": "string" },
+        "value": { "type": "number" },
+        "context": { "type": "string" }
+      },
+      "required": ["id", "timestamp", "type"]
+    },
+    "ScheduledAlert": {
+      "title": "Scheduled Alert",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "time": { "type": "string" },
+        "label": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "days": { "type": "array", "items": { "type": "number" } }
+      }
+    },
+    "CgmConfig": {
+      "title": "CGM Configuration",
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "enum": ["dexcom", "libre", "none"] },
+        "isConnected": { "type": "boolean" },
+        "lastSync": { "type": "string", "format": "date-time" }
+      }
+    },
+    "FamilyMember": {
+      "title": "Family Member",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": "string", "enum": ["caregiver", "supported"] },
+        "email": { "type": "string", "format": "email" },
+        "isSharingActive": { "type": "boolean" }
+      }
+    },
+    "EhrConfig": {
+      "title": "EHR Configuration",
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "enum": ["epic", "cerner", "smart_on_fhir", "none"] },
+        "isConnected": { "type": "boolean" },
+        "lastExport": { "type": "string", "format": "date-time" },
+        "fhirEndpoint": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserSettings",
+      "description": "User profile and settings."
+    },
+    "/users/{userId}/entries/{entryId}": {
+      "schema": "Entry",
+      "description": "Biological data logs for a specific user."
+    }
+  }
+}

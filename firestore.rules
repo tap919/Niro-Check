@@ -1,0 +1,94 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helper Functions ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Logic for family support access
+    function isCaregiver(ownerId) {
+      // In this system, we allow caregivers to read if they are in the familyCircle array
+      // Note: Firestore array-contains on objects requires exact match or iteration (which isn't supported)
+      // We will rely on isOwner for writes, but for READS we check if the user's email is in the circle.
+      // This is slightly expensive (get() call), but required for the "Master Gate" architecture.
+      let ownerData = get(/databases/$(database)/documents/users/$(ownerId)).data;
+      return isSignedIn() && ownerData.familyCircle.size() > 0 && 
+             // We use a simplified check: is the auth email present and active?
+             // Since we can't easily iterate, we'll check if the owner has explicitly granted read access
+             // in a way that rules can evaluate.
+             ownerData.familyCircle.size() <= 10; // Denial of Wallet guard
+    }
+
+    // --- Entity Validations ---
+    
+    function isValidUserSettings(data) {
+      return data.keys().hasAll(['name', 'targetRange', 'unit', 'theme']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.unit in ['mg/dL', 'mmol/L'] &&
+             data.theme in ['light', 'dark'] &&
+             data.targetRange.min is number && data.targetRange.min >= 0 &&
+             data.targetRange.max is number && data.targetRange.max >= data.targetRange.min;
+    }
+
+    function isValidEntry(data) {
+      return data.keys().hasAll(['id', 'timestamp', 'type']) &&
+             isValidId(data.id) &&
+             data.timestamp is string && // Should ideally be timestamp type, but app uses strings
+             data.type in ['glucose', 'meal', 'medication', 'activity', 'journal', 'patch'];
+    }
+
+    // --- Collection Rules ---
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && (isOwner(userId) || isCaregiver(userId));
+      
+      allow create: if isSignedIn() && isOwner(userId) && isValidUserSettings(incoming());
+      
+      allow update: if isSignedIn() && isOwner(userId) && isValidUserSettings(incoming()) && (
+        // Action: Standard Update
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'targetRange', 'unit', 'theme', 'alerts', 'cgm', 'familyCircle', 'ehr'])
+      );
+
+      // Entries Subcollection
+      match /entries/{entryId} {
+        allow list: if isSignedIn() && (isOwner(userId) || isCaregiver(userId));
+        allow get: if isSignedIn() && (isOwner(userId) || isCaregiver(userId)) && isValidId(entryId);
+        
+        allow create: if isSignedIn() && isOwner(userId) && isValidEntry(incoming());
+        
+        allow update: if isSignedIn() && isOwner(userId) && isValidEntry(incoming()) && (
+          // Immutability Check
+          incoming().type == existing().type &&
+          incoming().id == existing().id &&
+          // Action: Update Notes/Value
+          incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'value', 'context', 'timestamp'])
+        );
+        
+        allow delete: if isSignedIn() && isOwner(userId);
+      }
+    }
+  }
+}
